@@ -57,15 +57,35 @@ resource "aws_ecr_repository" "agent" {
   tags = var.tags
 }
 
-resource "null_resource" "docker_build_push" {
-  triggers = {
-    dockerfile_hash = filemd5("${path.module}/Dockerfile")
-    # source_hash     = sha256(join("", [for f in fileset("${path.module}", "**") : filesha256("${path.module}/${f}")]))
+locals {
+  # Track changes to source files
+  source_files = {
+    dockerfile = fileexists("${path.module}/Dockerfile") ? filemd5("${path.module}/Dockerfile") : ""
+    agent_py   = fileexists("${path.module}/agent.py") ? filemd5("${path.module}/agent.py") : ""
+    pyproject  = fileexists("${path.module}/pyproject.toml") ? filemd5("${path.module}/pyproject.toml") : ""
+    uv_lock    = fileexists("${path.module}/uv.lock") ? filemd5("${path.module}/uv.lock") : ""
   }
+
+  # Create a hash of all source files combined
+  source_hash = substr(sha256(join("", values(local.source_files))), 0, 12)
+}
+
+resource "null_resource" "docker_build_push" {
+  triggers = local.source_files
 
   provisioner "local-exec" {
     command = <<-EOT
-      aws ecr get-login-password --region ${var.aws_region} | docker login --username AWS --password-stdin ${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com && docker build --platform linux/arm64 -t ${var.agent_name}:latest ${path.module} && docker tag ${var.agent_name}:latest ${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/${var.agent_name}:latest && docker push ${aws_ecr_repository.agent.repository_url}:latest
+      set -e
+      
+      aws ecr get-login-password --region ${var.aws_region} | \
+        docker login --username AWS --password-stdin \
+        ${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com      
+      docker build --platform linux/arm64 \
+        -t ${var.agent_name}:${local.source_hash} \
+        ${path.module}
+      docker tag ${var.agent_name}:${local.source_hash} \
+        ${aws_ecr_repository.agent.repository_url}:${local.source_hash}
+      docker push ${aws_ecr_repository.agent.repository_url}:${local.source_hash}
     EOT
   }
 
@@ -206,7 +226,7 @@ resource "aws_bedrockagentcore_agent_runtime" "runtime" {
 
   agent_runtime_artifact {
     container_configuration {
-      container_uri = "${aws_ecr_repository.agent.repository_url}:latest"
+      container_uri = "${aws_ecr_repository.agent.repository_url}:${local.source_hash}"
     }
   }
 
@@ -242,4 +262,9 @@ output "runtime_id" {
 output "ecr_repository_url" {
   description = "ECR Repository URL"
   value       = aws_ecr_repository.agent.repository_url
+}
+
+output "image_tag" {
+  description = "Docker image tag based on source code hash"
+  value       = local.source_hash
 }
